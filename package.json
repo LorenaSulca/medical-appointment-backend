@@ -1,0 +1,36 @@
+{
+  "name": "medical-appointment-backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "jest --runInBand",
+    "check": "tsc --noEmit",
+    "package": "serverless package --stage dev --region us-east-1",
+    "deploy:dev": "serverless deploy --stage dev --region us-east-1",
+    "remove:dev": "serverless remove --stage dev --region us-east-1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.162",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^26.1.1",
+    "jest": "^30.4.2",
+    "serverless": "^4.39.0",
+    "ts-jest": "^29.4.11",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=24 <25"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1085.0",
+    "@aws-sdk/client-eventbridge": "^3.1085.0",
+    "@aws-sdk/client-sns": "^3.1085.0",
+    "@aws-sdk/lib-dynamodb": "^3.1085.0",
+    "mysql2": "^3.22.6"
+  }
+}

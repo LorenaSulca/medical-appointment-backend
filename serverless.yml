@@ -1,0 +1,636 @@
+service: medical-appointment-backend
+
+frameworkVersion: "4"
+
+params:
+  dev:
+    peDbPassword: ${env:PE_DB_PASSWORD, 'ChangeMe123!'}
+    clDbPassword: ${env:CL_DB_PASSWORD, 'ChangeMe123!'}
+
+provider:
+  name: aws
+  runtime: nodejs24.x
+  region: ${opt:region, 'us-east-1'}
+  stage: ${opt:stage, 'dev'}
+  memorySize: 256
+  timeout: 10
+
+  logRetentionInDays: 3
+
+  environment:
+    STAGE: ${self:provider.stage}
+    NODE_OPTIONS: --enable-source-maps
+
+    APPOINTMENTS_TABLE:
+      Ref: AppointmentsTable
+
+    APPOINTMENTS_BY_ID_INDEX: GSI1
+
+    APPOINTMENT_TOPIC_ARN:
+      Ref: AppointmentTopic
+
+    APPOINTMENT_EVENT_BUS_NAME:
+      Ref: AppointmentEventBus
+
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:Query
+            - dynamodb:UpdateItem
+          Resource:
+            - Fn::GetAtt:
+                - AppointmentsTable
+                - Arn
+
+            - Fn::Sub:
+                - "${TableArn}/index/*"
+                - TableArn:
+                    Fn::GetAtt:
+                      - AppointmentsTable
+                      - Arn
+
+        - Effect: Allow
+          Action:
+            - sns:Publish
+          Resource:
+            Ref: AppointmentTopic
+
+        - Effect: Allow
+          Action:
+            - events:PutEvents
+          Resource:
+            Fn::GetAtt:
+              - AppointmentEventBus
+              - Arn
+
+functions:
+  createAppointment:
+    handler: src/interfaces/lambdas/create-appointment.handler
+    events:
+      - httpApi:
+          path: /appointments
+          method: post
+
+  listAppointments:
+    handler: src/interfaces/lambdas/list-appointments.handler
+    events:
+      - httpApi:
+          path: /insureds/{insuredId}/appointments
+          method: get
+
+  processPEAppointment:
+    handler: src/interfaces/sqs/process-pe-appointment.handler
+    timeout: 20
+    environment:
+      PE_DB_HOST:
+        Fn::GetAtt:
+          - AppointmentsPEDB
+          - Endpoint.Address
+      PE_DB_PORT:
+        Fn::GetAtt:
+          - AppointmentsPEDB
+          - Endpoint.Port
+      PE_DB_USER: appointment_user
+      PE_DB_PASSWORD: ${param:peDbPassword}
+      PE_DB_NAME: appointments_pe
+      PE_DB_SSL: "true"
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - AppointmentPEQueue
+              - Arn
+          batchSize: 5
+          maximumBatchingWindow: 0
+          functionResponseType: ReportBatchItemFailures
+
+  processCLAppointment:
+    handler: src/interfaces/sqs/process-cl-appointment.handler
+    timeout: 20
+    environment:
+      CL_DB_HOST:
+        Fn::GetAtt:
+          - AppointmentsCLDB
+          - Endpoint.Address
+      CL_DB_PORT:
+        Fn::GetAtt:
+          - AppointmentsCLDB
+          - Endpoint.Port
+      CL_DB_USER: appointment_user
+      CL_DB_PASSWORD: ${param:clDbPassword}
+      CL_DB_NAME: appointments_cl
+      CL_DB_SSL: "true"
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - AppointmentCLQueue
+              - Arn
+          batchSize: 5
+          maximumBatchingWindow: 0
+          functionResponseType: ReportBatchItemFailures
+  completeAppointment:
+    handler: src/interfaces/sqs/complete-appointment.handler
+    timeout: 10
+    events:
+      - sqs:
+          arn:
+            Fn::GetAtt:
+              - AppointmentCompletionQueue
+              - Arn
+          batchSize: 5
+          maximumBatchingWindow: 0
+          functionResponseType: ReportBatchItemFailures
+
+resources:
+  Resources:
+    AppointmentsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName:
+          Fn::Sub:
+            - "${Service}-${Stage}-appointments"
+            - Service: ${self:service}
+              Stage: ${self:provider.stage}
+
+        BillingMode: PAY_PER_REQUEST
+
+        AttributeDefinitions:
+          - AttributeName: PK
+            AttributeType: S
+          - AttributeName: SK
+            AttributeType: S
+          - AttributeName: GSI1PK
+            AttributeType: S
+          - AttributeName: GSI1SK
+            AttributeType: S
+
+        KeySchema:
+          - AttributeName: PK
+            KeyType: HASH
+          - AttributeName: SK
+            KeyType: RANGE
+
+        GlobalSecondaryIndexes:
+          - IndexName: GSI1
+            KeySchema:
+              - AttributeName: GSI1PK
+                KeyType: HASH
+              - AttributeName: GSI1SK
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: false
+
+        SSESpecification:
+          SSEEnabled: true
+
+    AppointmentTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName:
+          Fn::Sub:
+            - "${Service}-${Stage}-appointment-topic"
+            - Service: ${self:service}
+              Stage: ${self:provider.stage}
+
+    AppointmentPEDeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName:
+          Fn::Sub:
+            - "${Service}-${Stage}-appointment-pe-dlq"
+            - Service: ${self:service}
+              Stage: ${self:provider.stage}
+
+        MessageRetentionPeriod: 345600
+
+    AppointmentCLDeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName:
+          Fn::Sub:
+            - "${Service}-${Stage}-appointment-cl-dlq"
+            - Service: ${self:service}
+              Stage: ${self:provider.stage}
+
+        MessageRetentionPeriod: 345600
+
+    AppointmentPEQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName:
+          Fn::Sub:
+            - "${Service}-${Stage}-appointment-pe"
+            - Service: ${self:service}
+              Stage: ${self:provider.stage}
+
+        VisibilityTimeout: 120
+        MessageRetentionPeriod: 86400
+
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt:
+              - AppointmentPEDeadLetterQueue
+              - Arn
+          maxReceiveCount: 3
+
+    AppointmentCLQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName:
+          Fn::Sub:
+            - "${Service}-${Stage}-appointment-cl"
+            - Service: ${self:service}
+              Stage: ${self:provider.stage}
+
+        VisibilityTimeout: 120
+        MessageRetentionPeriod: 86400
+
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt:
+              - AppointmentCLDeadLetterQueue
+              - Arn
+          maxReceiveCount: 3
+
+    AppointmentPESubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn:
+          Ref: AppointmentTopic
+
+        Protocol: sqs
+
+        Endpoint:
+          Fn::GetAtt:
+            - AppointmentPEQueue
+            - Arn
+
+        RawMessageDelivery: false
+
+        FilterPolicyScope: MessageAttributes
+
+        FilterPolicy:
+          countryISO:
+            - PE
+
+    AppointmentCLSubscription:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn:
+          Ref: AppointmentTopic
+
+        Protocol: sqs
+
+        Endpoint:
+          Fn::GetAtt:
+            - AppointmentCLQueue
+            - Arn
+
+        RawMessageDelivery: false
+
+        FilterPolicyScope: MessageAttributes
+
+        FilterPolicy:
+          countryISO:
+            - CL
+
+    AppointmentQueuesPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - Ref: AppointmentPEQueue
+          - Ref: AppointmentCLQueue
+
+        PolicyDocument:
+          Version: "2012-10-17"
+
+          Statement:
+            - Sid: AllowAppointmentTopicToSendMessages
+              Effect: Allow
+
+              Principal:
+                Service: sns.amazonaws.com
+
+              Action:
+                - sqs:SendMessage
+
+              Resource:
+                - Fn::GetAtt:
+                    - AppointmentPEQueue
+                    - Arn
+
+                - Fn::GetAtt:
+                    - AppointmentCLQueue
+                    - Arn
+
+              Condition:
+                ArnEquals:
+                  aws:SourceArn:
+                    Ref: AppointmentTopic
+
+    AppointmentEventBus:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name:
+          Fn::Sub:
+            - "${Service}-${Stage}-event-bus"
+            - Service: ${self:service}
+              Stage: ${self:provider.stage}
+
+    AppointmentCompletionDeadLetterQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName:
+          Fn::Sub:
+            - "${Service}-${Stage}-completion-dlq"
+            - Service: ${self:service}
+              Stage: ${self:provider.stage}
+
+        MessageRetentionPeriod: 345600
+
+    AppointmentCompletionQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName:
+          Fn::Sub:
+            - "${Service}-${Stage}-completion"
+            - Service: ${self:service}
+              Stage: ${self:provider.stage}
+
+        VisibilityTimeout: 60
+        MessageRetentionPeriod: 86400
+
+        RedrivePolicy:
+          deadLetterTargetArn:
+            Fn::GetAtt:
+              - AppointmentCompletionDeadLetterQueue
+              - Arn
+
+          maxReceiveCount: 3
+
+    AppointmentCompletedRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name:
+          Fn::Sub:
+            - "${Service}-${Stage}-completed-rule"
+            - Service: ${self:service}
+              Stage: ${self:provider.stage}
+
+        EventBusName:
+          Ref: AppointmentEventBus
+
+        State: ENABLED
+
+        EventPattern:
+          source:
+            - medical-appointment.country-processor
+
+          detail-type:
+            - AppointmentCompleted
+
+          detail:
+            status:
+              - completed
+
+        Targets:
+          - Id: AppointmentCompletionQueueTarget
+
+            Arn:
+              Fn::GetAtt:
+                - AppointmentCompletionQueue
+                - Arn
+    
+    AppointmentCompletionQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - Ref: AppointmentCompletionQueue
+
+        PolicyDocument:
+          Version: "2012-10-17"
+
+          Statement:
+            - Sid: AllowEventBridgeToSendMessages
+              Effect: Allow
+
+              Principal:
+                Service: events.amazonaws.com
+
+              Action:
+                - sqs:SendMessage
+
+              Resource:
+                Fn::GetAtt:
+                  - AppointmentCompletionQueue
+                  - Arn
+
+              Condition:
+                ArnEquals:
+                  aws:SourceArn:
+                    Fn::GetAtt:
+                      - AppointmentCompletedRule
+                      - Arn
+
+    RDSVPC:
+      Type: AWS::EC2::VPC
+      Properties:
+        CidrBlock: 10.0.0.0/16
+        EnableDnsSupport: true
+        EnableDnsHostnames: true
+
+    InternetGateway:
+      Type: AWS::EC2::InternetGateway
+
+    VPCGatewayAttachment:
+      Type: AWS::EC2::VPCGatewayAttachment
+      Properties:
+        VpcId:
+          Ref: RDSVPC
+        InternetGatewayId:
+          Ref: InternetGateway
+
+    RDSPublicSubnetA:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId:
+          Ref: RDSVPC
+        CidrBlock: 10.0.1.0/24
+        AvailabilityZone:
+          Fn::Select:
+            - 0
+            - Fn::GetAZs: ""
+
+    RDSPublicSubnetB:
+      Type: AWS::EC2::Subnet
+      Properties:
+        VpcId:
+          Ref: RDSVPC
+        CidrBlock: 10.0.2.0/24
+        AvailabilityZone:
+          Fn::Select:
+            - 1
+            - Fn::GetAZs: ""
+
+    RDSPublicRouteTable:
+      Type: AWS::EC2::RouteTable
+      Properties:
+        VpcId:
+          Ref: RDSVPC
+
+    RDSPublicRoute:
+      Type: AWS::EC2::Route
+      DependsOn: InternetGateway
+      Properties:
+        RouteTableId:
+          Ref: RDSPublicRouteTable
+        DestinationCidrBlock: 0.0.0.0/0
+        GatewayId:
+          Ref: InternetGateway
+
+    RDSPublicSubnetARouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId:
+          Ref: RDSPublicSubnetA
+        RouteTableId:
+          Ref: RDSPublicRouteTable
+
+    RDSPublicSubnetBRouteTableAssociation:
+      Type: AWS::EC2::SubnetRouteTableAssociation
+      Properties:
+        SubnetId:
+          Ref: RDSPublicSubnetB
+        RouteTableId:
+          Ref: RDSPublicRouteTable
+
+    RDSDBSubnetGroup:
+      Type: AWS::RDS::DBSubnetGroup
+      Properties:
+        DBSubnetGroupDescription: Subnet group for RDS MySQL instances
+        SubnetIds:
+          - Ref: RDSPublicSubnetA
+          - Ref: RDSPublicSubnetB
+
+    RDSSecurityGroup:
+      Type: AWS::EC2::SecurityGroup
+      Properties:
+        GroupDescription: Allow MySQL access from anywhere (test project)
+        VpcId:
+          Ref: RDSVPC
+        SecurityGroupIngress:
+          - IpProtocol: tcp
+            FromPort: 3306
+            ToPort: 3306
+            CidrIp: 0.0.0.0/0
+        SecurityGroupEgress:
+          - IpProtocol: -1
+            CidrIp: 0.0.0.0/0
+
+    AppointmentsPEDB:
+      Type: AWS::RDS::DBInstance
+      DeletionPolicy: Delete
+      Properties:
+        DBInstanceIdentifier: ${self:service}-${self:provider.stage}-appointments-pe
+        DBName: appointments_pe
+        Engine: mysql
+        EngineVersion: "8.0"
+        DBInstanceClass: db.t3.micro
+        AllocatedStorage: 20
+        StorageType: gp2
+        MasterUsername: appointment_user
+        MasterUserPassword: ${param:peDbPassword}
+        DBSubnetGroupName:
+          Ref: RDSDBSubnetGroup
+        VPCSecurityGroups:
+          - Fn::GetAtt:
+              - RDSSecurityGroup
+              - GroupId
+        PubliclyAccessible: true
+        BackupRetentionPeriod: 0
+        DeletionProtection: false
+        MonitoringInterval: 0
+        CopyTagsToSnapshot: true
+
+    AppointmentsCLDB:
+      Type: AWS::RDS::DBInstance
+      DeletionPolicy: Delete
+      Properties:
+        DBInstanceIdentifier: ${self:service}-${self:provider.stage}-appointments-cl
+        DBName: appointments_cl
+        Engine: mysql
+        EngineVersion: "8.0"
+        DBInstanceClass: db.t3.micro
+        AllocatedStorage: 20
+        StorageType: gp2
+        MasterUsername: appointment_user
+        MasterUserPassword: ${param:clDbPassword}
+        DBSubnetGroupName:
+          Ref: RDSDBSubnetGroup
+        VPCSecurityGroups:
+          - Fn::GetAtt:
+              - RDSSecurityGroup
+              - GroupId
+        PubliclyAccessible: true
+        BackupRetentionPeriod: 0
+        DeletionProtection: false
+        MonitoringInterval: 0
+        CopyTagsToSnapshot: true
+
+  Outputs:
+    AppointmentsTableName:
+      Value:
+        Ref: AppointmentsTable
+
+    AppointmentTopicArn:
+      Value:
+        Ref: AppointmentTopic
+
+    AppointmentPEQueueUrl:
+      Value:
+        Ref: AppointmentPEQueue
+
+    AppointmentCLQueueUrl:
+      Value:
+        Ref: AppointmentCLQueue
+
+    AppointmentPEDeadLetterQueueUrl:
+      Value:
+        Ref: AppointmentPEDeadLetterQueue
+
+    AppointmentCLDeadLetterQueueUrl:
+      Value:
+        Ref: AppointmentCLDeadLetterQueue
+
+    AppointmentEventBusName:
+      Value:
+        Ref: AppointmentEventBus
+      
+    AppointmentCompletionQueueUrl:
+      Value:
+        Ref: AppointmentCompletionQueue
+
+    AppointmentCompletionDeadLetterQueueUrl:
+      Value:
+        Ref: AppointmentCompletionDeadLetterQueue
+
+    AppointmentsPEEndpoint:
+      Value:
+        Fn::GetAtt:
+          - AppointmentsPEDB
+          - Endpoint.Address
+
+    AppointmentsCLEndpoint:
+      Value:
+        Fn::GetAtt:
+          - AppointmentsCLDB
+          - Endpoint.Address
+package:
+  individually: true

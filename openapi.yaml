@@ -1,0 +1,208 @@
+openapi: "3.0.3"
+info:
+  title: Medical Appointment Backend API
+  description: |
+    API for scheduling medical appointments for insured individuals.
+    Supports both Peru (PE) and Chile (CL) with country-specific processing.
+  version: "1.0.0"
+
+servers:
+  - url: https://hamug0apz3.execute-api.us-east-1.amazonaws.com
+    description: Production API Gateway endpoint (deployed stage: dev)
+
+paths:
+  /appointments:
+    post:
+      summary: Create a new appointment request
+      description: |
+        Submits a medical appointment request. The request is stored as "pending"
+        and processed asynchronously via SNS → SQS → country-specific Lambda →
+        MySQL RDS. Returns 202 immediately with the appointment ID.
+      operationId: createAppointment
+      tags:
+        - Appointments
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAppointmentRequest"
+            example:
+              insuredId: "12345"
+              scheduleId: 100
+              countryISO: "PE"
+      responses:
+        "202":
+          description: Appointment accepted for processing
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateAppointmentResponse"
+        "400":
+          description: Validation error (invalid insuredId, scheduleId, or countryISO)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /insureds/{insuredId}/appointments:
+    get:
+      summary: List appointments by insured ID
+      description: Returns all appointments for a given insured ID with their current status.
+      operationId: listAppointmentsByInsured
+      tags:
+        - Appointments
+      parameters:
+        - name: insuredId
+          in: path
+          required: true
+          description: 5-digit insured code (can have leading zeros)
+          schema:
+            type: string
+            pattern: "^\\d{5}$"
+            example: "12345"
+      responses:
+        "200":
+          description: List of appointments for the insured
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ListAppointmentsResponse"
+        "400":
+          description: Validation error (invalid insuredId)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+components:
+  schemas:
+    CreateAppointmentRequest:
+      type: object
+      required:
+        - insuredId
+        - scheduleId
+        - countryISO
+      properties:
+        insuredId:
+          type: string
+          pattern: "^\\d{5}$"
+          description: 5-digit insured code (can have leading zeros, e.g. "00123")
+          example: "12345"
+        scheduleId:
+          type: integer
+          description: |
+            Identifier for the appointment slot. The slot represents a combination of
+            medical center, specialty, doctor, and date/time.
+          example: 100
+        countryISO:
+          type: string
+          enum:
+            - PE
+            - CL
+          description: Country ISO code. Only "PE" (Peru) or "CL" (Chile) are supported.
+          example: "PE"
+
+    CreateAppointmentResponse:
+      type: object
+      properties:
+        appointmentId:
+          type: string
+          format: uuid
+          description: Unique identifier for the appointment
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        status:
+          type: string
+          description: Initial status of the appointment
+          example: "pending"
+        message:
+          type: string
+          description: Confirmation message
+          example: "El agendamiento está siendo procesado."
+
+    Appointment:
+      type: object
+      properties:
+        appointmentId:
+          type: string
+          format: uuid
+          example: "a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+        insuredId:
+          type: string
+          pattern: "^\\d{5}$"
+          example: "12345"
+        scheduleId:
+          type: integer
+          example: 100
+        countryISO:
+          type: string
+          enum:
+            - PE
+            - CL
+          example: "PE"
+        status:
+          type: string
+          enum:
+            - pending
+            - completed
+          example: "completed"
+        createdAt:
+          type: string
+          format: date-time
+          example: "2024-09-30T12:30:00.000Z"
+        updatedAt:
+          type: string
+          format: date-time
+          example: "2024-09-30T12:31:00.000Z"
+
+    ListAppointmentsResponse:
+      type: object
+      properties:
+        insuredId:
+          type: string
+          example: "12345"
+        appointments:
+          type: array
+          items:
+            $ref: "#/components/schemas/Appointment"
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              example: "VALIDATION_ERROR"
+            message:
+              type: string
+              example: "El código del asegurado debe tener exactamente 5 dígitos."
+            statusCode:
+              type: integer
+              example: 400
+
+  examples:
+    PeruAppointmentRequest:
+      value:
+        insuredId: "12345"
+        scheduleId: 100
+        countryISO: "PE"
+
+    ChileAppointmentRequest:
+      value:
+        insuredId: "67890"
+        scheduleId: 200
+        countryISO: "CL"
