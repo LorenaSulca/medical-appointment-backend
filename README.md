@@ -1,3 +1,5 @@
+**[EN]** | [ES](README.es.md)
+
 # Medical Appointment Backend
 
 Serverless backend for medical appointment scheduling, supporting both Peru (PE) and Chile (CL). Built with AWS (Lambda, API Gateway, DynamoDB, SNS, SQS, EventBridge, RDS) using the Serverless Framework, TypeScript, and Node.js.
